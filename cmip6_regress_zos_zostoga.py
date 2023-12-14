@@ -30,10 +30,10 @@ out_dir = '/Volumes/Naamloos/PhD_Data/CMIP6/regression/zoszostoga_zostoga' #set 
 
 #### find list of models providing both zos/zostoga
 models = list(set(os.listdir(zostoga_dir)) & set(os.listdir(zos_dir))) 
-models = [m for m in models if '.' not in m] #exclude MRI?
-models.remove('MRI-ESM2-0') #some issues with the starting values of this data, see email with VMS
+models = [m for m in models if '.' not in m] 
 models.sort()
 
+coefs_output = []
 for m,model in enumerate(models): #for each model
     print('Processing: ' + model)
     ssp_files = fnmatch.filter(os.listdir(os.path.join(zostoga_dir,model)),'*ssp*nc') #find available SSP simulations for zostoga (could be multiple variants per ssp)
@@ -41,7 +41,7 @@ for m,model in enumerate(models): #for each model
     unique_ssps.sort()
     
     model_data = [] #list to append SSP output to for current model
-    fns = []
+    variants = []
     for s,ssp in enumerate(unique_ssps):#enumerate(unique_ssps): #for each unique SSP
         files = fnmatch.filter(ssp_files,'*'+ssp+'*') #get simulations for that SSP        
         ssp_passed = 0 #track if simulations succesfully loaded in for current SSP
@@ -49,7 +49,7 @@ for m,model in enumerate(models): #for each model
         for f,zostoga_ssp_file in enumerate(files): #for each variant of current SSP
             print('Opening: ' + zostoga_ssp_file)
             variant = zostoga_ssp_file.split('_')[4]
-        
+            
             try: 
                 zos_ssp_file = fnmatch.filter(os.listdir(os.path.join(zos_dir,model)),'*'+ssp+'*'+variant+'*nc')[0]
                 zos_hist_file = fnmatch.filter(os.listdir(os.path.join(zos_dir,model)),'*'+'historical'+'*'+variant+'*nc')[0]
@@ -66,8 +66,8 @@ for m,model in enumerate(models): #for each model
             except:
                 print('Could not open all files required for regression, trying next simulation.')
                 continue
-            
-            fns.append(zostoga_ssp_file) #keep track of files used
+    
+            variants.append(variant) #keep track of files used
             
             zos_zostoga = xr.merge((zos,zostoga.squeeze())) #merge zos & zostoga into one dataset & assign coordinates
             zos_zostoga = zos_zostoga.resample(time='1Y').mean(dim='time') #compute annual means
@@ -94,13 +94,27 @@ for m,model in enumerate(models): #for each model
     dzos_zostoga = dzos_zostoga.sel(time=slice(str(ref_period[0]),str(zos_zostoga.time[-1]))) #select period to use for regression
     
     regr_coefs = xr.concat([regress_dzoszostoga_on_dzostoga(dzos_zostoga.sel(ssp=k).dropna(dim='time',subset=['zostoga'])) for k in dzos_zostoga.ssp.values],dim='ssp') #do the regression for each SSP
-    regr_coefs = xr.concat((regr_coefs,regress_dzoszostoga_on_dzostoga(zos_zostoga.stack(f=('time','ssp'),create_index=False).dropna(dim='f',subset=['zostoga']))),dim='ssp') #add the regression for all SSPs merged
-   
-    regr_coefs['ssp'] = np.hstack([zos_zostoga.ssp.values,'merged']) #add SSP coordinate
-    regr_coefs.attrs['ref_period'] = ref_period #add some attributes
-    regr_coefs.attrs['files_used'] = fns
+    regr_coefs = xr.concat((regr_coefs,regress_dzoszostoga_on_dzostoga(dzos_zostoga.stack(f=('time','ssp'),create_index=False).dropna(dim='f',subset=['zostoga']))),dim='ssp') #add the regression for all SSPs merged
     
+    regr_coefs['ssp'] = np.hstack([zos_zostoga.ssp.values,'merged']) #add SSP coordinate
+    regr_coefs = regr_coefs.assign_coords({'source_id':model})
+    regr_coefs['variant'] = (['ssp'],np.hstack((variants,np.nan)))
+    regr_coefs.attrs['ref_period'] = ref_period #add some attributes
+    
+    #store prediction based on regresson coefficient per model
+    prediction = xr.polyval(dzos_zostoga.zostoga,regr_coefs.polyfit_coefficients.isel(ssp=np.arange(len(regr_coefs.ssp)-1))).to_dataset(name='prediction')
+    prediction['prediction_ssp_independent'] = xr.polyval(dzos_zostoga.zostoga,regr_coefs.polyfit_coefficients.isel(ssp=-1))
+    prediction['bias'] = prediction['prediction'] - dzos_zostoga.zoszostoga
+    prediction['bias_ssp_independent'] = prediction['prediction_ssp_independent'] - dzos_zostoga.zoszostoga
+    prediction['pctBias_2081_2100'] = 100 * prediction['bias'].sel(time=slice('2081','2100')).mean(dim='time') / dzos_zostoga.zos.sel(time=slice('2081','2100')).mean(dim='time')
+    prediction['pctBias_2081_2100_ssp_independent'] = 100 * prediction['bias_ssp_independent'].sel(time=slice('2081','2100')).mean(dim='time') / dzos_zostoga.zos.sel(time=slice('2081','2100')).mean(dim='time')
     
     if os.path.exists(os.path.join(out_dir,model)) == False: #store
         os.mkdir(os.path.join(out_dir,model))
-    regr_coefs.to_netcdf(os.path.join(out_dir,model,'linregression_coefs.nc'),mode='w')
+    prediction.to_netcdf(os.path.join(out_dir,model,model+'_zoszostoga_linregression_prediction.nc'),mode='w')
+    
+    coefs_output.append(regr_coefs)
+    
+#store regression coefficients for ensemble    
+coefs_ds = xr.concat(coefs_output,dim='source_id')
+coefs_ds.to_netcdf(os.path.join(out_dir,'zoszostoga_zostoga_linregression_coefs.nc'),mode='w')
